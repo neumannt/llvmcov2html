@@ -1,6 +1,8 @@
 #include <llvm/ProfileData/Coverage/CoverageMapping.h>
+#include <llvm/Support/VirtualFileSystem.h>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <regex>
 #include <string>
 #include <vector>
@@ -13,8 +15,9 @@
 using namespace std;
 //---------------------------------------------------------------------------
 static unique_ptr<llvm::coverage::CoverageMapping> loadCoverage(const string& objectFile, const string& profileFile) {
+   auto fs = llvm::vfs::getRealFileSystem();;
    llvm::StringRef objectFiles[1] = {objectFile};
-   auto res = llvm::coverage::CoverageMapping::load(objectFiles, profileFile);
+   auto res = llvm::coverage::CoverageMapping::load(objectFiles, profileFile, *fs);
    if (!res) {
       cerr << "unable to load profile" << endl;
       exit(1);
@@ -22,25 +25,39 @@ static unique_ptr<llvm::coverage::CoverageMapping> loadCoverage(const string& ob
    return move(*res);
 }
 //---------------------------------------------------------------------------
-void escapeHtml(ostream& out, const string& s)
+static void escapeHtml(ostream& out, string_view s)
 // Write a string, escaping HTML as needed
 {
+   const char *current = s.data(), *end = s.data();
    for (char c : s) {
+      string_view escaped;
       switch (c) {
-         case '<': out << "&lt;"; break;
-         case '>': out << "&gt;"; break;
-         case '&': out << "&amp;"; break;
-         case '\"': out << "&quot;"; break;
+         case '<': escaped = "&lt;"; break;
+         case '>': escaped = "&gt;"; break;
+         case '&': escaped = "&amp;"; break;
+         case '\"': escaped = "&quot;"; break;
          case '\n':
-         case '\r': out << " "; break;
-         default: out << c; break;
+         case '\r': escaped = " "; break;
+         default: ++end; continue;
       }
+      auto sv = string_view(current, end);
+      out << sv << escaped;
+      current = end = end + 1;
    }
+   auto sv = string_view(current, end);
+   out << sv;
 }
+//---------------------------------------------------------------------------
+struct HitList {
+   vector<unsigned> hits, misses;
+};
+using CoverageList = map<string, HitList>;
 //---------------------------------------------------------------------------
 class SourceWriter {
    private:
    ostream& out;
+   CoverageList& coverageList;
+   string fileName;
    struct Part {
       string str;
       unsigned count;
@@ -54,13 +71,13 @@ class SourceWriter {
    unsigned executableLines = 0, hitLines = 0;
 
    /// Constructor
-   SourceWriter(ostream& out) : out(out) {}
+   SourceWriter(ostream& out, CoverageList& coverageList, string fileName) : out(out), coverageList(coverageList), fileName(fileName) {}
 
    /// Add a fragment
    void addData(string str, unsigned count, bool hasData, bool regionEntry);
 
    /// Write the current line
-   void finishLine();
+   void finishLine(unsigned lineNo);
 };
 //---------------------------------------------------------------------------
 void SourceWriter::addData(string str, unsigned count, bool hasData, bool regionEntry) {
@@ -79,12 +96,15 @@ static bool isTrivialCode(const string& code)
          R"(^;$)"
          "|"
          // Brackets
-         R"(^\s*[{}]\s*$)");
+         R"(^\s*[{}]*\s*$)"
+         "|"
+         // LLVM attributes C++11's "= default;" to the last t
+         R"(^t$)");
    }();
    return regex_match(code, trivialRegex);
 }
 //---------------------------------------------------------------------------
-void SourceWriter::finishLine()
+void SourceWriter::finishLine(unsigned lineNo)
 // Write the current line
 {
    unsigned maxCount = 0, candidates = 0, hitCandidates = 0, regionEntry = 0;
@@ -100,6 +120,8 @@ void SourceWriter::finishLine()
       executableLines++;
       if (hitCandidates)
          hitLines++;
+      auto& c = coverageList[fileName];
+      (hitCandidates ? c.hits : c.misses).push_back(lineNo);
    }
 
    // Write the line intro
@@ -178,7 +200,7 @@ class SourceReader {
    unsigned lineNo, colPos;
 
    public:
-   SourceReader(istream& in, SourceWriter& out, string extraIgnore);
+   SourceReader(istream& in, SourceWriter& out, const vector<string>& extraIgnore);
 
    //// Skip to a position
    void skipTo(unsigned line, unsigned col, unsigned count, bool hasCode, unsigned regionEntry);
@@ -186,7 +208,7 @@ class SourceReader {
    void flush();
 };
 //---------------------------------------------------------------------------
-SourceReader::SourceReader(istream& in, SourceWriter& out, string extraIgnore)
+SourceReader::SourceReader(istream& in, SourceWriter& out, const vector<string>& extraIgnore)
    : out(out), lineNo(0), colPos(0) {
    // Collect all lines
    string s;
@@ -206,7 +228,7 @@ SourceReader::SourceReader(istream& in, SourceWriter& out, string extraIgnore)
          } else if (s.find("LCOV_EXCL_LINE") != string::npos) {
             ignoreLines.push_back(lines.size());
             ignoreLine = true;
-         } else if ((!extraIgnore.empty()) && (s.find(extraIgnore) != string::npos)) {
+         } else if (any_of(extraIgnore.begin(), extraIgnore.end(), [&](const string& extraIgnore) { return (!extraIgnore.empty()) && (s.find(extraIgnore) != string::npos); })) {
             ignoreLines.push_back(lines.size());
             ignoreLine = true;
          }
@@ -279,7 +301,7 @@ void SourceReader::skipTo(unsigned targetLine, unsigned col, unsigned count, boo
             bool ignore = (lines[lineNo - 1].ignoreFrom <= colPos) && (colPos < lines[lineNo - 1].ignoreTo);
             out.addData(getSubstr(lines[lineNo - 1].line, colPos, ~0u), count, hasCode && (count || !ignore), lineNo == regionEntry);
          }
-         out.finishLine();
+         out.finishLine(lineNo);
       }
       while (lineNo < targetLine) {
          if (lineNo >= lines.size())
@@ -300,7 +322,7 @@ void SourceReader::skipTo(unsigned targetLine, unsigned col, unsigned count, boo
                bool ignore = (i.ignoreFrom != i.ignoreTo);
                out.addData(i.line, count, hasCode && (count || !ignore), lineNo == regionEntry);
             }
-            out.finishLine();
+            out.finishLine(lineNo);
          }
       }
    }
@@ -316,16 +338,16 @@ void SourceReader::flush()
 {
    if (lineNo) {
       out.addData(lines[lineNo - 1].line.substr(colPos), 0, false, 0);
-      out.finishLine();
+      out.finishLine(lineNo);
       ++lineNo;
    }
    for (unsigned limit = lines.size(); lineNo <= limit; ++lineNo) {
       out.addData(lines[lineNo - 1].line, 0, false, 0);
-      out.finishLine();
+      out.finishLine(lineNo);
    }
 }
 //---------------------------------------------------------------------------
-static void processCode(ostream& out, llvm::coverage::CoverageMapping& coverage, llvm::StringRef file, const string& extraIgnore, unsigned& hitLines, unsigned& executableLines)
+static void processCode(ostream& out, CoverageList& coverageList, llvm::coverage::CoverageMapping& coverage, llvm::StringRef file, const vector<string>& extraIgnore, unsigned& hitLines, unsigned& executableLines)
 // Process a file
 {
    hitLines = executableLines = 0;
@@ -335,7 +357,7 @@ static void processCode(ostream& out, llvm::coverage::CoverageMapping& coverage,
       return;
    }
 
-   SourceWriter writer(out);
+   SourceWriter writer(out, coverageList, file.str());
    SourceReader reader(in, writer, extraIgnore);
    auto data = coverage.getCoverageForFile(file);
    unsigned currentCount = 0, regionEntry = 0;
@@ -343,7 +365,7 @@ static void processCode(ostream& out, llvm::coverage::CoverageMapping& coverage,
    for (auto& i : data) {
       reader.skipTo(i.Line, i.Col, currentCount, hasCode, regionEntry);
       currentCount = i.Count;
-      hasCode = i.HasCount;
+      hasCode = i.HasCount && (!i.IsGapRegion);
       regionEntry = i.IsRegionEntry ? i.Line : 0;
    }
    reader.flush();
@@ -434,12 +456,12 @@ static void writeFooter(ostream& out)
        << endl;
 }
 //---------------------------------------------------------------------------
-static bool processFile(const string& outFile, llvm::coverage::CoverageMapping& coverage, llvm::StringRef file, const string& extraIgnore, unsigned& hitLines, unsigned& executableLines, const string& binaryName, const string& timestamp, const string& prettyFile)
+static bool processFile(CoverageList& coverageList, const string& outFile, llvm::coverage::CoverageMapping& coverage, llvm::StringRef file, const vector<string>& extraIgnore, unsigned& hitLines, unsigned& executableLines, const string& binaryName, const string& timestamp, const string& prettyFile)
 // Process a file
 {
    // Check the source code
    stringstream code;
-   processCode(code, coverage, file, extraIgnore, hitLines, executableLines);
+   processCode(code, coverageList, coverage, file, extraIgnore, hitLines, executableLines);
    if (!executableLines)
       return false;
 
@@ -554,12 +576,13 @@ static string getFileTimestamp(const string& file)
 //---------------------------------------------------------------------------
 int main(int argc, char** argv) {
    // Interpret the arguments
-   string projectRoot, extraIgnore;
+   string projectRoot;
+   vector<string> extraIgnore;
    vector<string> ignoreDirs;
 
    bool hasProjectRoot = false;
    vector<string> args;
-   for (int index = 1; index != argc; ++index) {
+   for (int index = 1; index < argc; ++index) {
       if (argv[index][0] == '-') {
          string a = argv[index];
          if (a == "--") {
@@ -572,7 +595,7 @@ int main(int argc, char** argv) {
                projectRoot += '/';
             hasProjectRoot = true;
          } else if (a.substr(0, 15) == "--exclude-line=") {
-            extraIgnore = a.substr(15);
+            extraIgnore.push_back(a.substr(15));
          } else if (a.substr(0, 14) == "--exclude-dir=") {
             string dirs = a.substr(14);
             regex splitRegex(",");
@@ -631,14 +654,14 @@ int main(int argc, char** argv) {
    }
 
    // Translate all files
-   unsigned fileCount = 0;
    struct FileInfo {
       string prettyName, htmlFile;
       unsigned hitLines, executableLines;
    };
    vector<FileInfo> fileInfo;
+   CoverageList coverageList;
    for (auto& f : files) {
-      string prettyName = f.str();
+      string prettyName = f.str(), relName = "file";
       if ((!projectRoot.empty()) && (prettyName.substr(0, projectRoot.size()) == projectRoot)) {
          bool skip = false;
 
@@ -651,6 +674,7 @@ int main(int argc, char** argv) {
 
          if (skip) continue;
 
+         relName = prettyName.substr(projectRoot.size()) + ".html";
          prettyName = "[...]/" + prettyName.substr(projectRoot.size());
       }
       while (prettyName.find("/./") != string::npos) {
@@ -658,12 +682,11 @@ int main(int argc, char** argv) {
          prettyName = prettyName.substr(0, split) + prettyName.substr(split + 3);
       }
 
-      string relName = "file" + to_string(fileCount) + ".html";
+      replace(relName.begin(), relName.end(), '/', '_');
       string fileName = targetDir + relName;
       unsigned hitLines, executableLines;
-      if (!processFile(fileName, *coverage, f, extraIgnore, hitLines, executableLines, args[1], timestamp, prettyName))
+      if (!processFile(coverageList, fileName, *coverage, f, extraIgnore, hitLines, executableLines, args[1], timestamp, prettyName))
          continue;
-      ++fileCount;
 
       fileInfo.push_back({prettyName, relName, hitLines, executableLines});
    }
@@ -684,7 +707,7 @@ int main(int argc, char** argv) {
          executableLines += i.executableLines;
       }
       writeHeader(out, binaryName, timestamp, "", hitLines, executableLines);
-      cout << "coverage: " << computePerc(hitLines, executableLines) / 10.0 << "%" << endl;
+      cout << "coverage: " << computePerc(hitLines, executableLines) / 10.0 << "%, " << (executableLines - hitLines) << " lines not reached" << endl;
 
       out << R"(<center>
                   <table width="80%" cellpadding="2" cellspacing="1" border="0">
@@ -701,7 +724,7 @@ int main(int argc, char** argv) {
           << endl;
       for (auto& i : fileInfo) {
          unsigned perc = computePerc(i.hitLines, i.executableLines);
-         const char* qc = (perc >= 750) ? "Hi" : (perc >= 350) ? "Med" : "Lo";
+         const char* qc = (perc >= 750) ? "Hi" : ((perc >= 350) ? "Med" : "Lo");
          out << R"(<tr>
                      <td class="coverFile"><a href=")"
              << i.htmlFile << "\">";
@@ -724,6 +747,18 @@ int main(int argc, char** argv) {
           << "<br/>" << endl;
 
       writeFooter(out);
+   }
+   {
+      ofstream out(targetDir + "hits");
+      for (auto& c : coverageList)
+         for (auto l : c.second.hits)
+            out << c.first << ":" << l << endl;
+   }
+   {
+      ofstream out(targetDir + "notreached");
+      for (auto& c : coverageList)
+         for (auto l : c.second.misses)
+            out << c.first << ":" << l << endl;
    }
 
    // Write extra files
