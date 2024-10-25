@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(llvmcov2html)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 
-set (LLVM_VERSION "12")
+set (LLVM_VERSION "19.1")
 find_package(LLVM ${LLVM_VERSION} REQUIRED CONFIG)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})

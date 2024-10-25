@@ -31,5 +31,5 @@ the `tmp` directory. Start with `index.html` to get an overview.
 Building
 --------
 
-`llvmcov2html` requires [LLVM 12](https://llvm.org) and a C++17 compiler.
+`llvmcov2html` requires [LLVM 19](https://llvm.org) and a C++20 compiler.
 Both plain `make` and `cmake` are supported.
